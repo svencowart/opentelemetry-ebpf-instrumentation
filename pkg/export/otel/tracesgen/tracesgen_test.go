@@ -87,6 +87,138 @@ func TestTraceAttributesSelector_GraphQLDocumentSelection(t *testing.T) {
 	assert.Equal(t, document, selectedDocument.Str())
 }
 
+func TestHTTPServerSpanURLQuery(t *testing.T) {
+	optInCfg := &attributes.SelectorConfig{
+		SelectionCfg: attributes.Selection{
+			attributes.Traces.Section: attributes.InclusionLists{
+				Include: []string{string(attr.HTTPUrlQuery)},
+			},
+		},
+	}
+
+	t.Run("url.query present by default", func(t *testing.T) {
+		// url.query is Conditionally Required per OTel semconv, so it is on by default.
+		span := &request.Span{Type: request.EventTypeHTTP, Method: "GET", Path: "/", FullPath: "/?cmd=BLABLA", Status: 200}
+		defaultAttrs, err := UserSelectedAttributes(&attributes.SelectorConfig{})
+		require.NoError(t, err)
+		selected := AttrsToMap(TraceAttributesSelector(span, defaultAttrs))
+		val, ok := selected.Get("url.query")
+		require.True(t, ok)
+		assert.Equal(t, "cmd=BLABLA", val.Str())
+	})
+
+	t.Run("url.query absent when no query string", func(t *testing.T) {
+		span := &request.Span{Type: request.EventTypeHTTP, Method: "GET", Path: "/health", FullPath: "/health", Status: 200}
+		defaultAttrs, err := UserSelectedAttributes(&attributes.SelectorConfig{})
+		require.NoError(t, err)
+		selected := AttrsToMap(TraceAttributesSelector(span, defaultAttrs))
+		_, ok := selected.Get("url.query")
+		assert.False(t, ok)
+	})
+
+	t.Run("sensitive key redacted in url.query", func(t *testing.T) {
+		span := &request.Span{Type: request.EventTypeHTTP, Method: "GET", Path: "/", FullPath: "/?cmd=OBIWANKENOBI&signature=abc123", Status: 200}
+		optInAttrs, err := UserSelectedAttributes(optInCfg)
+		require.NoError(t, err)
+		selected := AttrsToMap(TraceAttributesSelector(span, optInAttrs, "signature"))
+		val, ok := selected.Get("url.query")
+		require.True(t, ok)
+		assert.Equal(t, "cmd=OBIWANKENOBI&signature=REDACTED", val.Str())
+	})
+
+	t.Run("sensitive key also scrubbed from url.full on client span", func(t *testing.T) {
+		// url.full is a client-span attribute; server spans use url.path instead.
+		span := &request.Span{
+			Type: request.EventTypeHTTPClient, Method: "GET", Path: "/", FullPath: "/?cmd=OBIWANKENOBI&sig=abc123",
+			Host: "example.com", HostPort: 80, Status: 200,
+		}
+		optInAttrs, err := UserSelectedAttributes(optInCfg)
+		require.NoError(t, err)
+		selected := AttrsToMap(TraceAttributesSelector(span, optInAttrs, "sig"))
+		val, ok := selected.Get("url.full")
+		require.True(t, ok)
+		assert.Contains(t, val.Str(), "cmd=OBIWANKENOBI")
+		assert.Contains(t, val.Str(), "sig=REDACTED")
+		assert.NotContains(t, val.Str(), "abc123")
+	})
+
+	t.Run("no redaction when no sensitive params passed to TraceAttributesSelector", func(t *testing.T) {
+		// TraceAttributesSelector is the single-span public API; callers must pass
+		// sensitive params explicitly. The default list flows through GroupSpans via
+		// SensitiveQueryParams in DefaultConfig.
+		span := &request.Span{Type: request.EventTypeHTTP, Method: "GET", Path: "/", FullPath: "/?sig=abc123", Status: 200}
+		optInAttrs, err := UserSelectedAttributes(optInCfg)
+		require.NoError(t, err)
+		selected := AttrsToMap(TraceAttributesSelector(span, optInAttrs))
+		val, ok := selected.Get("url.query")
+		require.True(t, ok)
+		assert.Equal(t, "sig=abc123", val.Str())
+	})
+
+	t.Run("url.query suppressed when explicitly excluded", func(t *testing.T) {
+		// Operators can opt out of url.query via:
+		//   attributes.select.traces.exclude: [url.query]
+		excludeCfg := &attributes.SelectorConfig{
+			SelectionCfg: attributes.Selection{
+				attributes.Traces.Section: attributes.InclusionLists{
+					Exclude: []string{string(attr.HTTPUrlQuery)},
+				},
+			},
+		}
+		span := &request.Span{Type: request.EventTypeHTTP, Method: "GET", Path: "/", FullPath: "/?cmd=BLABLA", Status: 200}
+		excludeAttrs, err := UserSelectedAttributes(excludeCfg)
+		require.NoError(t, err)
+		selected := AttrsToMap(TraceAttributesSelector(span, excludeAttrs))
+		_, ok := selected.Get("url.query")
+		assert.False(t, ok, "url.query should be absent when explicitly excluded")
+	})
+
+	t.Run("url.full keeps scrubbed query even when url.query is excluded", func(t *testing.T) {
+		excludeCfg := &attributes.SelectorConfig{
+			SelectionCfg: attributes.Selection{
+				attributes.Traces.Section: attributes.InclusionLists{
+					Exclude: []string{string(attr.HTTPUrlQuery)},
+				},
+			},
+		}
+		span := &request.Span{
+			Type: request.EventTypeHTTPClient, Method: "GET", Path: "/", FullPath: "/?cmd=BLABLA&sig=secret",
+			Host: "example.com", HostPort: 80, Status: 200,
+		}
+		excludeAttrs, err := UserSelectedAttributes(excludeCfg)
+		require.NoError(t, err)
+		selected := AttrsToMap(TraceAttributesSelector(span, excludeAttrs, "sig"))
+		_, ok := selected.Get("url.query")
+		assert.False(t, ok, "url.query should be absent when excluded")
+		urlFull, ok := selected.Get("url.full")
+		require.True(t, ok, "url.full should be present")
+		assert.Contains(t, urlFull.Str(), "cmd=BLABLA")
+		assert.Contains(t, urlFull.Str(), "sig=REDACTED")
+		assert.NotContains(t, urlFull.Str(), "secret")
+	})
+
+	t.Run("url.path omitted when path is unobservable", func(t *testing.T) {
+		// FastCGI spans with no REQUEST_URI (truncated buffer or older nginx config)
+		// produce Path="". OTel semconv says omit the attribute rather than emit "".
+		span := &request.Span{Type: request.EventTypeHTTP, Method: "GET", Path: "", FullPath: "", Status: 200}
+		defaultAttrs, err := UserSelectedAttributes(&attributes.SelectorConfig{})
+		require.NoError(t, err)
+		selected := AttrsToMap(TraceAttributesSelector(span, defaultAttrs))
+		_, ok := selected.Get("url.path")
+		assert.False(t, ok, "url.path must be omitted when path is unobservable")
+	})
+
+	t.Run("url.query absent when FullPath is empty", func(t *testing.T) {
+		// Same truncation scenario: FullPath="" means there is no query string to emit.
+		span := &request.Span{Type: request.EventTypeHTTP, Method: "GET", Path: "", FullPath: "", Status: 200}
+		defaultAttrs, err := UserSelectedAttributes(&attributes.SelectorConfig{})
+		require.NoError(t, err)
+		selected := AttrsToMap(TraceAttributesSelector(span, defaultAttrs))
+		_, ok := selected.Get("url.query")
+		assert.False(t, ok, "url.query must be absent when FullPath is empty")
+	})
+}
+
 func TestGenAIToolCallAttributes(t *testing.T) {
 	t.Run("nil tool calls", func(t *testing.T) {
 		assert.Nil(t, genAIToolCallAttributes(nil))
